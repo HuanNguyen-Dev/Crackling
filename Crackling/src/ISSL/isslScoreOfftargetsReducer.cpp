@@ -123,11 +123,6 @@ int main(int argc, char** argv)
     // Streaming reduction
     ofstream out(outFile);
 
-    // uint64_t curQuery = all[0].querySignature;
-    // uint32_t curTarget = all[0].targetId;
-
-    // double mitSum = 0.0;
-    // double cfdSum = 0.0;
 
     size_t i = 0;
 
@@ -137,21 +132,21 @@ int main(int argc, char** argv)
 
         double mitSum = 0.0;
         double cfdSum = 0.0;
+        size_t startOfQueryIndex = i;
 
-        std::unordered_set<uint32_t> seenTargets;
-        while (i < all.size() &&
-            all[i].querySignature == query) {
+        while (i < all.size() && all[i].querySignature == query) {
 
             auto &r = all[i];
 
-            if (seenTargets.insert(r.targetId).second) {
+            // If it's the first element of the query OR the targetId is different 
+            // from the previous one, it's a unique target for this query.
+            if (i == startOfQueryIndex || r.targetId != all[i-1].targetId) {
                 mitSum += r.mitScore;
                 cfdSum += r.cfdScore;
             }
 
             i++;
         }
-
         double finalMit = 10000.0 / (100.0 + mitSum);
         double finalCfd = 10000.0 / (100.0 + cfdSum);
 

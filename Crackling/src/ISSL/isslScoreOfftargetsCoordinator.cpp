@@ -122,6 +122,7 @@ int main(int argc, char **argv)
 
     // Determine start and end bytes for each shard
     for (int shard = 0; shard < numShards; shard ++){
+        // Calculate the starting slice of the ISSL for each shard
         size_t startSlice = shard * slicesPerShard;
         size_t endSlice = std::min((shard + 1) * slicesPerShard, sliceCount);
 
@@ -133,7 +134,7 @@ int main(int argc, char **argv)
 
         string shardFile = prefix + "_shard_" + to_string(shard) + ".txt";
         ofstream out(shardFile);
-        // might not need all that, better to keep it lean maybe
+        // To Do: Check if this is required in future use; better to keep it lean otherwise
         out << shard << " "<< startSlice << " " << endSlice << " " << startByte << " " << endByte << "\n";
         out.close();
 
@@ -145,7 +146,3 @@ int main(int argc, char **argv)
 
     return 0;
 } 
-
-// notes include a new slice count
-// notes shard file should include a prefix to identify which shard
-// also a job id will be required
