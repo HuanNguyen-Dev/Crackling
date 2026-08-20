@@ -118,13 +118,22 @@ int main(int argc, char **argv)
     }
 
     // Base offset in bytes from start of ISSL to just before all signatures array
-    size_t baseOffsetBytes = (6 + (scoresCount * 2) + offtargetsCount + (sliceCount * sliceLimit)) * sizeof(uint64_t);
-
+    // size_t baseOffsetBytes = (6 + (scoresCount * 2) + offtargetsCount + (sliceCount * sliceLimit)) * sizeof(uint64_t);
+    size_t baseOffsetBytes =
+      6 * sizeof(size_t)
+    + scoresCount * (sizeof(uint64_t) + sizeof(double))
+    + offtargetsCount * sizeof(uint64_t)
+    + (sliceCount * sliceLimit) * sizeof(size_t);
+    
+    numShards = std::min(numShards, sliceCount);
     // Determine start and end bytes for each shard
     for (int shard = 0; shard < numShards; shard ++){
         // Calculate the starting slice of the ISSL for each shard
-        size_t startSlice = shard * slicesPerShard;
-        size_t endSlice = std::min((shard + 1) * slicesPerShard, sliceCount);
+        size_t startSlice =
+            (shard * sliceCount) / numShards;
+
+        size_t endSlice =
+            ((shard + 1) * sliceCount) / numShards;
 
         if (startSlice >= sliceCount) continue; // Skip empty shards
 

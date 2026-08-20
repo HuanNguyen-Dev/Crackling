@@ -202,6 +202,7 @@ int main(int argc, char **argv)
     sliceCount      = slicelistHeader[4]; 
     scoresCount     = slicelistHeader[5]; 
     
+    cout << "offtargetsCount = " << offtargetsCount << endl;
     /** The maximum number of possibly slice identities
      *      4 chars per slice * each of A,T,C,G = limit of 16
      */
@@ -266,7 +267,6 @@ int main(int argc, char **argv)
     // Skip to the start of the slice to process
     fseek(fp, startByte, SEEK_SET);
 
-    // We add one as coordinator makes it one byte short of the actual range
     size_t sliceBytes = endByte - startByte;
     size_t numElements = sliceBytes / sizeof(uint64_t);
 
@@ -300,6 +300,7 @@ int main(int argc, char **argv)
     vector<vector<uint64_t *>> sliceLists(localSliceCount, vector<uint64_t *>(sliceLimit));
 
     uint64_t *offset = sliceSignatureBuffer.data();
+ 
     for (size_t i = startSlice; i < endSlice; i++) {
         size_t local_i = i - startSlice;
         for (size_t j = 0; j < sliceLimit; j++) {
@@ -307,6 +308,10 @@ int main(int argc, char **argv)
             sliceLists[local_i][j] = offset;
             offset += allSlicelistSizes[idx];
         }
+    }   
+    if (offset != sliceSignatureBuffer.data() + numElements)
+    {
+        fprintf(stderr, "Shard reconstruction mismatch\n");
     }
     
     /** Load query file (candidate guides)
@@ -385,7 +390,7 @@ int main(int argc, char **argv)
             
             int numOffTargetSitesScored = 0;
             double maximum_sum = (10000.0 - threshold*100) / threshold;
-            bool checkNextSlice = true;
+            // bool checkNextSlice = true;
             
             /** For each ISSL slice */
             /** We want to use the global i as bit extraction depends on absolute position
@@ -563,42 +568,42 @@ int main(int argc, char **argv)
 							numOffTargetSitesScored += occurrences;
 
 							/** Stop calculating global score early if possible */
-							if (scoreMethod == ScoreMethod::mitAndCfd) {
-								if (totScoreMit > maximum_sum && totScoreCfd > maximum_sum) {
-									checkNextSlice = false;
-									break;
-								}
-							}
-							if (scoreMethod == ScoreMethod::mitOrCfd) {
-								if (totScoreMit > maximum_sum || totScoreCfd > maximum_sum) {
-									checkNextSlice = false;
-									break;
-								}
-							}
-							if (scoreMethod == ScoreMethod::avgMitCfd) {
-								if (((totScoreMit + totScoreCfd) / 2.0) > maximum_sum) {
-									checkNextSlice = false;
-									break;
-								}
-							}
-							if (scoreMethod == ScoreMethod::mit) {
-								if (totScoreMit > maximum_sum) {
-									checkNextSlice = false;
-									break;
-								}
-							}
-							if (scoreMethod == ScoreMethod::cfd) {
-								if (totScoreCfd > maximum_sum) {
-									checkNextSlice = false;
-									break;
-								}
-							}
+				// 			if (scoreMethod == ScoreMethod::mitAndCfd) {
+				// 				if (totScoreMit > maximum_sum && totScoreCfd > maximum_sum) {
+				// 					checkNextSlice = false;
+				// 					break;
+				// 				}
+				// 			}
+				// 			if (scoreMethod == ScoreMethod::mitOrCfd) {
+				// 				if (totScoreMit > maximum_sum || totScoreCfd > maximum_sum) {
+				// 					checkNextSlice = false;
+				// 					break;
+				// 				}
+				// 			}
+				// 			if (scoreMethod == ScoreMethod::avgMitCfd) {
+				// 				if (((totScoreMit + totScoreCfd) / 2.0) > maximum_sum) {
+				// 					checkNextSlice = false;
+				// 					break;
+				// 				}
+				// 			}
+				// 			if (scoreMethod == ScoreMethod::mit) {
+				// 				if (totScoreMit > maximum_sum) {
+				// 					checkNextSlice = false;
+				// 					break;
+				// 				}
+				// 			}
+				// 			if (scoreMethod == ScoreMethod::cfd) {
+				// 				if (totScoreCfd > maximum_sum) {
+				// 					checkNextSlice = false;
+				// 					break;
+				// 				}
+				// 			}
 						}
                     }
                 }
 
-                if (!checkNextSlice)
-                    break;
+                // if (!checkNextSlice)
+                //     break;
             }
             if (!emit){
                 MapperResult q;
@@ -667,9 +672,9 @@ int main(int argc, char **argv)
 
 
     cout << "\n=== Memory Usage ===\n";
-    cout << "allSignatures: " << toMB(sliceSignatureBuffer.capacity() * sizeof(uint64_t)) << " MB\n";
-    cout << "queryDataSet:  " << toMB(queryDataSet.capacity()) * sizeof(char) << " MB\n";
-    cout << "offtargets:    " << toMB(offtargets.capacity() * sizeof(uint64_t)) << " MB\n";
+    cout << "allSignatures: " << toMB(sliceSignatureBuffer.size() * sizeof(uint64_t)) << " MB\n";
+    cout << "queryDataSet:  " << toMB(queryDataSet.size()) * sizeof(char) << " MB\n";
+    cout << "offtargets:    " << toMB(offtargets.size() * sizeof(uint64_t)) << " MB\n";
     cout << "====================\n";
     cout << "Mapper finished, results written to: " << shardFILEOUT << endl;
 
