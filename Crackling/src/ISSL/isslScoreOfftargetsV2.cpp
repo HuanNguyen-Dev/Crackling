@@ -95,7 +95,6 @@ auto toMB = [](size_t bytes) {
 int main(int argc, char **argv)
 {
     auto totalStart = std::chrono::steady_clock::now();
-
     if (argc < 4) {
         fprintf(stderr, "Usage: %s [issltable] [query file] [max distance] [score-threshold] [score-method]\n", argv[0]);
         exit(1);
@@ -431,8 +430,9 @@ int main(int argc, char **argv)
 								}
 								else if (dist > 0 && dist <= maxDist) {
 									cfdScore = cfdPamPenalties[0b1010]; // PAM: NGG, TODO: do not hard-code the PAM
-									
-									for (size_t pos = 0; pos < 20; pos++) {
+									uint64_t mismatchBits = mismatches;
+									while (mismatchBits) {
+                                        size_t pos = __builtin_ctzll(mismatchBits) >> 1;
 										size_t mask = pos << 4;
 										
 										/** Create the mask to look up the position-identity score
@@ -477,6 +477,7 @@ int main(int argc, char **argv)
 										if (searchSigIdentityPos >> 2 != offtargetIdentityPos) {
 											cfdScore *= cfdPosPenalties[mask];
 										}
+                                        mismatchBits &= mismatchBits - 1;
 									}
 								}
 								totScoreCfd += cfdScore * (double)occurrences;
@@ -530,10 +531,9 @@ int main(int argc, char **argv)
             memset(offtargetToggles.data(), 0, sizeof(uint64_t)*offtargetToggles.size());
         }
 
-    }
+}
     auto totalEnd = std::chrono::steady_clock::now();
     std::chrono::duration<double> totalElapsed = totalEnd - totalStart;
-
     
     /** Print global scores to stdout */
     for (size_t searchIdx = 0; searchIdx < querySignatures.size(); searchIdx++) {
@@ -550,9 +550,12 @@ int main(int argc, char **argv)
             printf("-1\n");
             
     }
+
     printf("\n=== Timing ===\n");
     printf("Total runtime:        %.6f seconds\n", totalElapsed.count());
     printf("===============\n");
+
+
     cout << "\n=== Memory Usage ===\n";
     cout << "allSignatures: " << toMB(allSignatures.size() * sizeof(uint64_t)) << " MB\n";
     cout << "queryDataSet:  " << toMB(queryDataSet.size()) * sizeof(char) << " MB\n";

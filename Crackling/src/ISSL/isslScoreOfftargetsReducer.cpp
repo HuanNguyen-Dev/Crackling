@@ -87,8 +87,16 @@ int main(int argc, char** argv)
     const char* outFile = argv[1];
 
     vector<MapperResult> all;
-    all.reserve(10000000); // optional tuning - im assuming 10 million results, not scalable
-    // this can be a start but we are essentially loading in ALL the duplicate pairs as well
+    // all.reserve(10000000); // optional tuning - im assuming 10 million results, not scalable
+    // // this can be a start but we are essentially loading in ALL the duplicate pairs as well
+    size_t totalBytes = 0;
+
+    for (int i = 3; i < argc; i++)
+    {
+        totalBytes += std::filesystem::file_size(argv[i]);
+    }
+
+    all.reserve(totalBytes / sizeof(MapperResult));
     
 
     // Load all mapper outputs
@@ -137,12 +145,28 @@ int main(int argc, char** argv)
         while (i < all.size() && all[i].querySignature == query) {
 
             auto &r = all[i];
-
+            if (r.targetId == UINT32_MAX){
+                i++;
+                continue;
+            }
             // If it's the first element of the query OR the targetId is different 
             // from the previous one, it's a unique target for this query.
             if (i == startOfQueryIndex || r.targetId != all[i-1].targetId) {
                 mitSum += r.mitScore;
                 cfdSum += r.cfdScore;
+            }
+
+            if (i != startOfQueryIndex &&
+            r.targetId != UINT32_MAX &&
+            r.targetId == all[i-1].targetId)
+            {
+                if (fabs(r.mitScore - all[i-1].mitScore) > 1e-9 ||
+                    fabs(r.cfdScore - all[i-1].cfdScore) > 1e-9)
+                {
+                    cerr << "MISMATCH duplicate detected for query "
+                     << signatureToSequence(query)
+                     << " targetId=" << r.targetId << "\n";
+                }
             }
 
             i++;
