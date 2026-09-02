@@ -54,6 +54,7 @@ g++ -o mapper isslScoreOfftargetsMapper.cpp -O3 -std=c++11 -fopenmp -mpopcnt -Ii
 #include <string>
 #include <unordered_set>
 #include <unordered_map>
+#include <sys/mman.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -283,10 +284,11 @@ int main(int argc, char **argv) {
         precalculatedScores.insert(pair<uint64_t, double>(mask, score));
     }
 
-    /** Load in all of the off-target sites */
-    vector<uint64_t> offtargets(offtargetsCount);
-    if (fread(offtargets.data(), sizeof(uint64_t), offtargetsCount, fp) == 0) {
-        fprintf(stderr, "Error reading index: loading off-target sequences failed\n");
+    /** Record the location of all of the off-target sites */
+    size_t offtargetsOffsetBytes = ftell(fp);
+    if (offtargetsCount > SIZE_MAX / sizeof(uint64_t) ||
+        fseek(fp, offtargetsCount * sizeof(uint64_t), SEEK_CUR) != 0) {
+        fprintf(stderr, "Error reading index: locating off-target sequences failed\n");
         return 1;
     }
 
@@ -330,21 +332,7 @@ int main(int argc, char **argv) {
 
     size_t bucketPayloadElements =
         (indexFileSize - baseOffsetBytes) / sizeof(uint64_t);
-    vector<uint64_t> sliceSignatureBuffer(bucketPayloadElements);
-
-    if (bucketPayloadElements > 0 &&
-        fread(sliceSignatureBuffer.data(), sizeof(uint64_t), bucketPayloadElements, fp)
-            != bucketPayloadElements) {
-        fprintf(
-            stderr,
-            "Error reading index: reading slice contents failed, Could not read all %zu elements\n",
-            bucketPayloadElements);
-        return 1;
-    }
-
-    /** End reading the index */
-    fclose(fp);
-    vector<uint64_t *> bucketPointers(sliceLimit, nullptr);
+    vector<const uint64_t *> bucketPointers(sliceLimit, nullptr);
     vector<size_t> selectedBucketSizes(sliceLimit, 0);
     vector<bool> bucketAvailable(sliceLimit, false);
     for (const auto &entry : selectedBuckets) {
@@ -365,13 +353,35 @@ int main(int argc, char **argv) {
             fprintf(stderr, "Bucket plan element count does not match ISSL metadata\n");
             return 1;
         }
-        bucketPointers[bucketId] = elementCount == 0
-            ? nullptr
-            : sliceSignatureBuffer.data() +
-                ((compactOffsetBytes - baseOffsetBytes) / sizeof(uint64_t));
         selectedBucketSizes[bucketId] = elementCount;
         bucketAvailable[bucketId] = true;
     }
+
+    /** Map the index so the large arrays are not copied into separate vectors */
+    void *indexMapping = mmap(
+        nullptr, indexFileSize, PROT_READ, MAP_PRIVATE, fileno(fp), 0);
+    if (indexMapping == MAP_FAILED) {
+        fprintf(stderr, "Error reading index: memory mapping failed\n");
+        fclose(fp);
+        return 1;
+    }
+
+    const char *mappedIndex = static_cast<const char *>(indexMapping);
+    const uint64_t *offtargets = reinterpret_cast<const uint64_t *>(
+        mappedIndex + offtargetsOffsetBytes);
+    const uint64_t *sliceSignatureBuffer = reinterpret_cast<const uint64_t *>(
+        mappedIndex + baseOffsetBytes);
+    for (const auto &entry : selectedBuckets) {
+        size_t bucketId = entry.first;
+        size_t compactOffsetBytes = entry.second.compactOffsetBytes;
+        bucketPointers[bucketId] = entry.second.elementCount == 0
+            ? nullptr
+            : sliceSignatureBuffer +
+                ((compactOffsetBytes - baseOffsetBytes) / sizeof(uint64_t));
+    }
+
+    /** End reading the index */
+    fclose(fp);
 
     /** Load query file (candidate guides)
      *      and prepare memory for calculated global scores
@@ -453,7 +463,7 @@ int main(int argc, char **argv) {
                     exit(1);
                 }
                 size_t signaturesInSlice = selectedBucketSizes[searchSlice];
-                uint64_t *sliceOffset = bucketPointers[searchSlice];
+                const uint64_t *sliceOffset = bucketPointers[searchSlice];
 
                 /** For each off-target signature in slice */
                 for (size_t j = 0; j < signaturesInSlice; j++) {
@@ -641,11 +651,12 @@ int main(int argc, char **argv) {
     shardOut.close();
 
     cout << "\n=== Memory Usage ===\n";
-    cout << "allSignatures: " << toMB(sliceSignatureBuffer.size() * sizeof(uint64_t)) << " MB\n";
+    cout << "allSignatures: " << toMB(bucketPayloadElements * sizeof(uint64_t)) << " MB\n";
     cout << "queryDataSet:  " << toMB(queryDataSet.size()) * sizeof(char) << " MB\n";
-    cout << "offtargets:    " << toMB(offtargets.size() * sizeof(uint64_t)) << " MB\n";
+    cout << "offtargets:    " << toMB(offtargetsCount * sizeof(uint64_t)) << " MB\n";
     cout << "====================\n";
     cout << "Mapper finished, results written to: " << shardFILEOUT << endl;
 
+    munmap(indexMapping, indexFileSize);
     return 0;
 }
