@@ -155,6 +155,10 @@ int main(int argc, char **argv) {
     std::string prefixID = argv[7];
     /** The maximum number of mismatches */
     int maxDist = atoi(argv[3]);
+    if (maxDist != 4) {
+        fprintf(stderr, "Bucket-selective scoring requires max distance 4\n");
+        return 1;
+    }
 
     /** The threshold used to exit scoring early */
     double threshold = atof(argv[4]);
@@ -191,13 +195,33 @@ int main(int argc, char **argv) {
         calcCfd = true;
     }
 
-    /** Read the slice and byte boundaries assigned to this Mapper invocation. */
+    /** Read the selected buckets assigned to this single-slice Mapper invocation. */
     const char *shardFile = argv[6];
     ifstream shardRead(shardFile);
-    size_t startSlice, endSlice, startByte, endByte;
+    size_t assignedSlice, selectedBucketCount;
     int shardId;
 
-    shardRead >> shardId >> startSlice >> endSlice >> startByte >> endByte;
+    shardRead >> shardId >> assignedSlice >> selectedBucketCount;
+    if (!shardRead) {
+        fprintf(stderr, "Error reading bucket plan header\n");
+        return 1;
+    }
+
+    struct SelectedBucket {
+        size_t compactOffsetBytes;
+        size_t elementCount;
+    };
+    unordered_map<size_t, SelectedBucket> selectedBuckets;
+    for (size_t i = 0; i < selectedBucketCount; i++) {
+        size_t bucketId, compactOffsetBytes, elementCount;
+        shardRead >> bucketId >> compactOffsetBytes >> elementCount;
+        if (!shardRead || !selectedBuckets.emplace(
+                bucketId,
+                SelectedBucket{compactOffsetBytes, elementCount}).second) {
+            fprintf(stderr, "Invalid or duplicate bucket-plan entry\n");
+            return 1;
+        }
+    }
     shardRead.close();
 
     /** Begin reading the binary encoded ISSL, structured as:
@@ -236,6 +260,10 @@ int main(int argc, char **argv) {
      *      4 chars per slice * each of A,T,C,G = limit of 16
      */
     size_t sliceLimit = 1 << sliceWidth;
+    if (sliceCount != 5 || assignedSlice >= sliceCount) {
+        fprintf(stderr, "Unsupported slice configuration in bucket plan\n");
+        return 1;
+    }
 
     /** Read in the precalculated MIT scores 
      *      - `mask` is a 2-bit encoding of mismatch positions
@@ -285,65 +313,64 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /** The contents of the slices assigned to this Mapper
+    /** The compact contents of the buckets assigned to this Mapper
      *
      *      Stored contiguously
      *
      *      Each signature (64-bit) is structured as:
      *          <occurrences 32-bit><off-target-id 32-bit>
      */
-    // vector<uint64_t> allSignatures(seqCount * sliceCount);
+    size_t baseOffsetBytes = ftell(fp);
+    size_t indexFileSize = getFileSize(argv[1]);
+    if (indexFileSize < baseOffsetBytes ||
+        (indexFileSize - baseOffsetBytes) % sizeof(uint64_t) != 0) {
+        fprintf(stderr, "Invalid compact bucket payload size\n");
+        return 1;
+    }
 
-    // Skip to the start of the slice to process
-    fseek(fp, startByte, SEEK_SET);
+    size_t bucketPayloadElements =
+        (indexFileSize - baseOffsetBytes) / sizeof(uint64_t);
+    vector<uint64_t> sliceSignatureBuffer(bucketPayloadElements);
 
-    size_t sliceBytes = endByte - startByte;
-    size_t numElements = sliceBytes / sizeof(uint64_t);
-
-    vector<uint64_t> sliceSignatureBuffer(numElements);
-
-    if (fread(sliceSignatureBuffer.data(), sizeof(uint64_t), numElements, fp) != numElements) {
+    if (bucketPayloadElements > 0 &&
+        fread(sliceSignatureBuffer.data(), sizeof(uint64_t), bucketPayloadElements, fp)
+            != bucketPayloadElements) {
         fprintf(
             stderr,
             "Error reading index: reading slice contents failed, Could not read all %zu elements\n",
-            numElements);
+            bucketPayloadElements);
         return 1;
     }
 
     /** End reading the index */
     fclose(fp);
-    size_t localSliceCount = endSlice - startSlice;
-    /** Start constructing index in memory
-     *
-     *      To begin, reverse the contiguous storage of the slices,
-     *         into the following:
-     *
-     *         + Slice 0 :
-     *         |---- AAAA : <slice contents>
-     *         |---- AAAC : <slice contents>
-     *         |----  ...
-     *         | 
-     *         + Slice 1 :
-     *         |---- AAAA : <slice contents>
-     *         |---- AAAC : <slice contents>
-     *         |---- ...
-     *         | ...
-     */
-    // Note: To Do: this should be using a new slice count
-    vector<vector<uint64_t *>> sliceLists(localSliceCount, vector<uint64_t *>(sliceLimit));
-
-    uint64_t *offset = sliceSignatureBuffer.data();
-
-    for (size_t i = startSlice; i < endSlice; i++) {
-        size_t local_i = i - startSlice;
-        for (size_t j = 0; j < sliceLimit; j++) {
-            size_t idx = i * sliceLimit + j;
-            sliceLists[local_i][j] = offset;
-            offset += allSlicelistSizes[idx];
+    vector<uint64_t *> bucketPointers(sliceLimit, nullptr);
+    vector<size_t> selectedBucketSizes(sliceLimit, 0);
+    vector<bool> bucketAvailable(sliceLimit, false);
+    for (const auto &entry : selectedBuckets) {
+        size_t bucketId = entry.first;
+        size_t compactOffsetBytes = entry.second.compactOffsetBytes;
+        size_t elementCount = entry.second.elementCount;
+        if (bucketId >= sliceLimit || compactOffsetBytes < baseOffsetBytes ||
+            compactOffsetBytes % sizeof(uint64_t) != 0 ||
+            compactOffsetBytes - baseOffsetBytes > indexFileSize - baseOffsetBytes ||
+            elementCount >
+                (indexFileSize - compactOffsetBytes) / sizeof(uint64_t)) {
+            fprintf(stderr, "Bucket plan points outside compact payload\n");
+            return 1;
         }
-    }
-    if (offset != sliceSignatureBuffer.data() + numElements) {
-        fprintf(stderr, "Shard reconstruction mismatch\n");
+        size_t expectedCount =
+            allSlicelistSizes[assignedSlice * sliceLimit + bucketId];
+        if (elementCount != expectedCount) {
+            fprintf(stderr, "Bucket plan element count does not match ISSL metadata\n");
+            return 1;
+        }
+        bucketPointers[bucketId] = elementCount == 0
+            ? nullptr
+            : sliceSignatureBuffer.data() +
+                ((compactOffsetBytes - baseOffsetBytes) / sizeof(uint64_t));
+        selectedBucketSizes[bucketId] = elementCount;
+        bucketAvailable[bucketId] = true;
     }
 
     /** Load query file (candidate guides)
@@ -413,21 +440,20 @@ int main(int argc, char **argv) {
             double maximum_sum = (10000.0 - threshold * 100) / threshold;
             // bool checkNextSlice = true;
 
-            /** For each ISSL slice */
-            /** We want to use the global i as bit extraction depends on absolute position
-             *  and the 'slicelistsizes' are laid out for all slices globally
-             */
-            for (size_t i = startSlice; i < endSlice; i++) {
+            /** Process only the semantic slice assigned to this Mapper. */
+            {
+                size_t i = assignedSlice;
                 uint64_t sliceMask = sliceLimit - 1;
                 int sliceShift = sliceWidth * i;
                 sliceMask = sliceMask << sliceShift;
-                auto &sliceList = sliceLists[i - startSlice];
 
                 uint64_t searchSlice = (searchSignature & sliceMask) >> sliceShift;
-
-                size_t idx = i * sliceLimit + searchSlice;
-                size_t signaturesInSlice = allSlicelistSizes[idx];
-                uint64_t *sliceOffset = sliceList[searchSlice];
+                if (!bucketAvailable[searchSlice]) {
+                    fprintf(stderr, "Query requires a bucket absent from the bucket plan\n");
+                    exit(1);
+                }
+                size_t signaturesInSlice = selectedBucketSizes[searchSlice];
+                uint64_t *sliceOffset = bucketPointers[searchSlice];
 
                 /** For each off-target signature in slice */
                 for (size_t j = 0; j < signaturesInSlice; j++) {
