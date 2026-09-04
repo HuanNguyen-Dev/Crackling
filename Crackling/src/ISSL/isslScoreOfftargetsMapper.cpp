@@ -7,9 +7,11 @@ scorer at commit e247e9b:
 
 https://github.com/bmds-lab/Crackling/blob/e247e9b48ca9ad8de04258d51295126250ef1c26/src/ISSL/isslScoreOfftargets.cpp
 
-It retains the original ISSL traversal and MIT/CFD scoring logic, but processes
-only the shard assigned to this Mapper invocation. Instead of producing final
-guide scores, it emits per-off-target score contributions for the downstream
+It retains the original MIT/CFD scoring logic, but consumes only the hydrated
+candidates for the bucket selected by this Mapper's semantic slice. Each
+candidate embeds its signature, original global ID and occurrence count, so the
+Mapper neither maps the global off-target catalogue nor allocates global-ID
+"seen" bitmaps. It emits per-off-target score contributions for the downstream
 Reducer in the Coordinator/Mapper/Reducer pipeline.
 
 Each OpenMP thread writes to a separate temporary binary file. The files are
@@ -63,7 +65,6 @@ g++ -o mapper isslScoreOfftargetsMapper.cpp -O3 -std=c++11 -fopenmp -mpopcnt -Ii
 #include <chrono>
 #include <bitset>
 #include <iostream>
-#include <climits>
 #include <stdio.h>
 #include <cstring>
 #include <omp.h>
@@ -85,6 +86,16 @@ struct MapperResult {
     double mitScore;
     double cfdScore;
 };
+
+/** Self-contained candidate record produced by isslExtractCandidates. */
+struct HydratedCandidate {
+    uint64_t signature;
+    uint32_t globalId;
+    uint32_t occurrences;
+};
+
+static_assert(sizeof(HydratedCandidate) == 16,
+              "HydratedCandidate must match Python struct format <QII");
 
 vector<uint8_t> nucleotideIndex(256);
 vector<char> signatureIndex(4);
@@ -135,10 +146,11 @@ string signatureToSequence(uint64_t signature) {
 auto toMB = [](size_t bytes) { return bytes / (1024.0 * 1024.0); };
 
 int main(int argc, char **argv) {
-    if (argc < 8) {
+    if (argc < 9) {
         fprintf(stderr,
-                "Usage: %s [issltable] [query file] [max distance] [score-threshold] "
-                "[score-method] [shard-file] [prefix]\n",
+                "Usage: %s [scoring-metadata] [query-file] [max-distance] "
+                "[score-threshold] [score-method] [candidates-file] "
+                "[bucket-plan] [prefix]\n",
                 argv[0]);
         exit(1);
     }
@@ -153,7 +165,7 @@ int main(int argc, char **argv) {
     signatureIndex[2] = 'G';
     signatureIndex[3] = 'T';
 
-    std::string prefixID = argv[7];
+    std::string prefixID = argv[8];
     /** The maximum number of mismatches */
     int maxDist = atoi(argv[3]);
     if (maxDist != 4) {
@@ -197,7 +209,7 @@ int main(int argc, char **argv) {
     }
 
     /** Read the selected buckets assigned to this single-slice Mapper invocation. */
-    const char *shardFile = argv[6];
+    const char *shardFile = argv[7];
     ifstream shardRead(shardFile);
     size_t assignedSlice, selectedBucketCount;
     int shardId;
@@ -225,14 +237,12 @@ int main(int argc, char **argv) {
     }
     shardRead.close();
 
-    /** Begin reading the binary encoded ISSL, structured as:
-     *      - a header (6 items)
-     *      - precalcuated local MIT scores
-     *      - all binary-encoded off-target sites
-     *      - slice list sizes
-     *      - slice contents
-     */
+    /** Read only the ISSL header and precalculated MIT score table. */
     FILE *fp = fopen(argv[1], "rb");
+    if (fp == nullptr) {
+        fprintf(stderr, "Error opening scoring metadata\n");
+        return 1;
+    }
 
     /** The index contains a fixed-sized header 
      *      - the number of off-targets in the index
@@ -256,7 +266,6 @@ int main(int argc, char **argv) {
     sliceCount = slicelistHeader[4];
     scoresCount = slicelistHeader[5];
 
-    cout << "offtargetsCount = " << offtargetsCount << endl;
     /** The maximum number of possibly slice identities
      *      4 chars per slice * each of A,T,C,G = limit of 16
      */
@@ -278,110 +287,64 @@ int main(int argc, char **argv) {
     for (int i = 0; i < scoresCount; i++) {
         uint64_t mask = 0;
         double score = 0.0;
-        fread(&mask, sizeof(uint64_t), 1, fp);
-        fread(&score, sizeof(double), 1, fp);
+        if (fread(&mask, sizeof(uint64_t), 1, fp) != 1 ||
+            fread(&score, sizeof(double), 1, fp) != 1) {
+            fprintf(stderr, "Error reading precalculated score metadata\n");
+            fclose(fp);
+            return 1;
+        }
 
         precalculatedScores.insert(pair<uint64_t, double>(mask, score));
     }
 
-    /** Record the location of all of the off-target sites */
-    size_t offtargetsOffsetBytes = ftell(fp);
-    if (offtargetsCount > SIZE_MAX / sizeof(uint64_t) ||
-        fseek(fp, offtargetsCount * sizeof(uint64_t), SEEK_CUR) != 0) {
-        fprintf(stderr, "Error reading index: locating off-target sequences failed\n");
+    fclose(fp);
+
+    /** Map the concatenated, self-contained hydrated candidate records. */
+    const char *candidateFile = argv[6];
+    size_t candidateFileSize = getFileSize(candidateFile);
+    if (candidateFileSize % sizeof(HydratedCandidate) != 0) {
+        fprintf(stderr, "Candidate file is not a multiple of 16 bytes\n");
         return 1;
     }
-
-    /** Prevent assessing an off-target site for multiple slices
-     *
-     *      Create enough 1-bit "seen" flags for the off-targets
-     *      We only want to score a candidate guide against an off-target once.
-     *      The least-significant bit represents the first off-target
-     *      0 0 0 1   0 1 0 0   would indicate that the 3rd and 5th off-target have been seen.
-     *      The CHAR_BIT macro tells us how many bits are in a byte (C++ >= 8 bits per byte)
-     */
-    uint64_t numOfftargetToggles =
-        (offtargetsCount / ((size_t)sizeof(uint64_t) * (size_t)CHAR_BIT)) + 1;
-
-    /** The number of signatures embedded per slice
-     *
-     *      These counts are stored contiguously
-     *
-     */
-    vector<size_t> allSlicelistSizes(sliceCount * sliceLimit);
-
-    if (fread(allSlicelistSizes.data(), sizeof(size_t), allSlicelistSizes.size(), fp) == 0) {
-        fprintf(stderr, "Error reading index: reading slice list sizes failed\n");
+    FILE *candidateFp = fopen(candidateFile, "rb");
+    if (candidateFp == nullptr) {
+        fprintf(stderr, "Error opening candidate file\n");
         return 1;
     }
-
-    /** The compact contents of the buckets assigned to this Mapper
-     *
-     *      Stored contiguously
-     *
-     *      Each signature (64-bit) is structured as:
-     *          <occurrences 32-bit><off-target-id 32-bit>
-     */
-    size_t baseOffsetBytes = ftell(fp);
-    size_t indexFileSize = getFileSize(argv[1]);
-    if (indexFileSize < baseOffsetBytes ||
-        (indexFileSize - baseOffsetBytes) % sizeof(uint64_t) != 0) {
-        fprintf(stderr, "Invalid compact bucket payload size\n");
-        return 1;
+    void *candidateMapping = nullptr;
+    if (candidateFileSize != 0) {
+        candidateMapping = mmap(nullptr, candidateFileSize, PROT_READ, MAP_PRIVATE,
+                                fileno(candidateFp), 0);
+        if (candidateMapping == MAP_FAILED) {
+            fprintf(stderr, "Error mapping candidate file\n");
+            fclose(candidateFp);
+            return 1;
+        }
     }
-
-    size_t bucketPayloadElements =
-        (indexFileSize - baseOffsetBytes) / sizeof(uint64_t);
-    vector<const uint64_t *> bucketPointers(sliceLimit, nullptr);
+    const HydratedCandidate *candidateRecords =
+        static_cast<const HydratedCandidate *>(candidateMapping);
+    vector<const HydratedCandidate *> bucketPointers(sliceLimit, nullptr);
     vector<size_t> selectedBucketSizes(sliceLimit, 0);
     vector<bool> bucketAvailable(sliceLimit, false);
     for (const auto &entry : selectedBuckets) {
         size_t bucketId = entry.first;
         size_t compactOffsetBytes = entry.second.compactOffsetBytes;
         size_t elementCount = entry.second.elementCount;
-        if (bucketId >= sliceLimit || compactOffsetBytes < baseOffsetBytes ||
-            compactOffsetBytes % sizeof(uint64_t) != 0 ||
-            compactOffsetBytes - baseOffsetBytes > indexFileSize - baseOffsetBytes ||
+        if (bucketId >= sliceLimit ||
+            compactOffsetBytes % sizeof(HydratedCandidate) != 0 ||
+            compactOffsetBytes > candidateFileSize ||
             elementCount >
-                (indexFileSize - compactOffsetBytes) / sizeof(uint64_t)) {
-            fprintf(stderr, "Bucket plan points outside compact payload\n");
-            return 1;
-        }
-        size_t expectedCount =
-            allSlicelistSizes[assignedSlice * sliceLimit + bucketId];
-        if (elementCount != expectedCount) {
-            fprintf(stderr, "Bucket plan element count does not match ISSL metadata\n");
+                (candidateFileSize - compactOffsetBytes) / sizeof(HydratedCandidate)) {
+            fprintf(stderr, "Bucket plan points outside candidate payload\n");
             return 1;
         }
         selectedBucketSizes[bucketId] = elementCount;
         bucketAvailable[bucketId] = true;
-    }
-
-    /** Map the index so the large arrays are not copied into separate vectors */
-    void *indexMapping = mmap(
-        nullptr, indexFileSize, PROT_READ, MAP_PRIVATE, fileno(fp), 0);
-    if (indexMapping == MAP_FAILED) {
-        fprintf(stderr, "Error reading index: memory mapping failed\n");
-        fclose(fp);
-        return 1;
-    }
-
-    const char *mappedIndex = static_cast<const char *>(indexMapping);
-    const uint64_t *offtargets = reinterpret_cast<const uint64_t *>(
-        mappedIndex + offtargetsOffsetBytes);
-    const uint64_t *sliceSignatureBuffer = reinterpret_cast<const uint64_t *>(
-        mappedIndex + baseOffsetBytes);
-    for (const auto &entry : selectedBuckets) {
-        size_t bucketId = entry.first;
-        size_t compactOffsetBytes = entry.second.compactOffsetBytes;
         bucketPointers[bucketId] = entry.second.elementCount == 0
             ? nullptr
-            : sliceSignatureBuffer +
-                ((compactOffsetBytes - baseOffsetBytes) / sizeof(uint64_t));
+            : candidateRecords +
+                (compactOffsetBytes / sizeof(HydratedCandidate));
     }
-
-    /** End reading the index */
-    fclose(fp);
 
     /** Load query file (candidate guides)
      *      and prepare memory for calculated global scores
@@ -432,10 +395,6 @@ int main(int argc, char **argv) {
         std::vector<MapperResult> writeBuffer;
         writeBuffer.reserve(BUF_SIZE); // May need to change based on testing
 
-        vector<uint64_t> offtargetToggles(numOfftargetToggles);
-
-        uint64_t *offtargetTogglesTail = offtargetToggles.data() + numOfftargetToggles - 1;
-
 /** For each candidate guide */
 #pragma omp for
         for (size_t searchIdx = 0; searchIdx < querySignatures.size(); searchIdx++) {
@@ -463,13 +422,14 @@ int main(int argc, char **argv) {
                     exit(1);
                 }
                 size_t signaturesInSlice = selectedBucketSizes[searchSlice];
-                const uint64_t *sliceOffset = bucketPointers[searchSlice];
+                const HydratedCandidate *sliceOffset = bucketPointers[searchSlice];
 
                 /** For each off-target signature in slice */
                 for (size_t j = 0; j < signaturesInSlice; j++) {
-                    auto signatureWithOccurrencesAndId = sliceOffset[j];
-                    auto signatureId = signatureWithOccurrencesAndId & 0xFFFFFFFFull;
-                    uint32_t occurrences = (signatureWithOccurrencesAndId >> (32));
+                    const HydratedCandidate &candidate = sliceOffset[j];
+                    uint64_t offtargetSignature = candidate.signature;
+                    uint32_t signatureId = candidate.globalId;
+                    uint32_t occurrences = candidate.occurrences;
 
                     /** Find the positions of mismatches 
                      *
@@ -497,7 +457,7 @@ int main(int argc, char **argv) {
                      *
                      *   popcount(mismatches):   4
                      */
-                    uint64_t xoredSignatures = searchSignature ^ offtargets[signatureId];
+                    uint64_t xoredSignatures = searchSignature ^ offtargetSignature;
                     uint64_t evenBits = xoredSignatures & 0xAAAAAAAAAAAAAAAAull;
                     uint64_t oddBits = xoredSignatures & 0x5555555555555555ull;
                     uint64_t mismatches = (evenBits >> 1) | oddBits;
@@ -505,14 +465,10 @@ int main(int argc, char **argv) {
                     // --- Distance is computed per unique (candidate guide (full sequence), off-target id) pair
                     if (dist >= 0 && dist <= maxDist) {
 
-                        /** Prevent assessing the same off-target for multiple slices */
-                        uint64_t seenOfftargetAlready = 0;
-                        uint64_t *ptrOfftargetFlag = (offtargetTogglesTail - (signatureId / 64));
-                        seenOfftargetAlready = (*ptrOfftargetFlag >> (signatureId % 64)) & 1ULL;
                         double mitContribution = 0.0;
                         double cfdContribution = 0.0;
 
-                        if (!seenOfftargetAlready) {
+                        {
                             // Begin calculating MIT score
                             if (calcMit) {
                                 if (dist > 0) {
@@ -570,7 +526,7 @@ int main(int argc, char **argv) {
 										 *      shift           00 00 00 00 00 01
 										 *      rev comp 3UL    00 00 00 00 00 10 (done below)
 										 */
-                                        uint64_t offtargetIdentityPos = offtargets[signatureId];
+                                        uint64_t offtargetIdentityPos = offtargetSignature;
                                         offtargetIdentityPos &= (3UL << (pos * 2));
                                         offtargetIdentityPos = offtargetIdentityPos >> (pos * 2);
 
@@ -604,7 +560,6 @@ int main(int argc, char **argv) {
 
                                 writeBuffer.clear();
                             }
-                            *ptrOfftargetFlag |= (1ULL << (signatureId % 64));
                             numOffTargetSitesScored += occurrences;
                         }
                     }
@@ -618,7 +573,6 @@ int main(int argc, char **argv) {
                 q.cfdScore = 0.0;
                 writeBuffer.push_back(q);
             }
-            memset(offtargetToggles.data(), 0, sizeof(uint64_t) * offtargetToggles.size());
         }
 
         // Flush any records remaining after the final iteration.
@@ -651,12 +605,14 @@ int main(int argc, char **argv) {
     shardOut.close();
 
     cout << "\n=== Memory Usage ===\n";
-    cout << "allSignatures: " << toMB(bucketPayloadElements * sizeof(uint64_t)) << " MB\n";
+    cout << "hydratedCandidates: " << toMB(candidateFileSize) << " MB\n";
     cout << "queryDataSet:  " << toMB(queryDataSet.size()) * sizeof(char) << " MB\n";
-    cout << "offtargets:    " << toMB(offtargetsCount * sizeof(uint64_t)) << " MB\n";
     cout << "====================\n";
     cout << "Mapper finished, results written to: " << shardFILEOUT << endl;
 
-    munmap(indexMapping, indexFileSize);
+    if (candidateFileSize != 0) {
+        munmap(candidateMapping, candidateFileSize);
+    }
+    fclose(candidateFp);
     return 0;
 }
